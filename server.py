@@ -73,12 +73,14 @@ def _ensure_kb_cache() -> None:
         "FROM issue_continuity"
     ):
         ser = (row["series"] or "").strip()
-        vol = row["volume"] if row["volume"] is not None else 1
-        yr = row["year"]
-        key = (ser.lower(), int(vol))
+        vol_raw = row["volume"]
+        vol = int(vol_raw) if str(vol_raw or "").isdigit() else 1
+        yr_raw = row["year"]
+        yr = int(yr_raw) if str(yr_raw or "").isdigit() else None
+        key = (ser.lower(), vol)
         st = vol_stats.get(key)
         if st is None:
-            st = {"series": ser, "volume": int(vol), "start_year": yr, "end_year": yr, "issue_count": 0}
+            st = {"series": ser, "volume": vol, "start_year": yr, "end_year": yr, "issue_count": 0}
             vol_stats[key] = st
         st["issue_count"] += 1
         if yr is not None:
@@ -280,8 +282,9 @@ def marvel_resolve_tpb(search_title: str, year: int | None = None) -> dict[str, 
     for k, rows in _KB_CACHE["reprints_by_title"].items():
         if all(tok in k for tok in tokens):
             for r in rows:
-                ry = r.get("year")
-                if year is None or not ry or abs(int(ry) - year) <= 2:
+                ry_raw = r.get("year")
+                ry = int(ry_raw) if str(ry_raw or "").isdigit() else None
+                if year is None or ry is None or abs(ry - int(year)) <= 2:
                     reprints = json.loads(r["reprint_of_json"] or "[]")
                     matches.append({
                         "title": r["title"],
@@ -292,7 +295,7 @@ def marvel_resolve_tpb(search_title: str, year: int | None = None) -> dict[str, 
                         "release_date": r.get("release_date"),
                         "collected_issues": reprints,
                     })
-    matches.sort(key=lambda x: (x.get("release_year") or 0, x.get("title") or ""))
+    matches.sort(key=lambda x: (int(x.get("release_year") or 0), x.get("title") or ""))
     return {
         "query": search_title,
         "year": year,
