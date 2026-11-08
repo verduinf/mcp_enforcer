@@ -9,14 +9,17 @@ over TLS (`https://192.168.178.36:8765/mcp`) with Uvicorn `--reload` auto-discov
 
 import datetime
 import glob
+import hashlib
 import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
 import threading
+import time
 import zipfile
 from typing import Any
 
@@ -301,6 +304,387 @@ def enforcer_git_sync(repo: str = "all") -> dict[str, Any]:
         "synced": results,
         "note": "If any watched .py file changed, Uvicorn --reload will automatically restart the worker within 1s.",
     }
+
+
+# -----------------------------------------------------------------------------
+# Remote Administration & Mutation Tools (Aether -> Enforcer Control Suite)
+# -----------------------------------------------------------------------------
+
+_LAST_ACTIVITY_TIME = time.time()
+_WATCHDOG_CONFIG: dict[str, Any] = {
+    "enabled": False,
+    "idle_timeout_seconds": 900,  # 15 minutes default
+    "sleep_plan_guid": "",
+    "sleep_plan_name": "",
+}
+
+
+def _get_powerplans() -> list[dict[str, Any]]:
+    """Parse output of `powercfg /list`."""
+    try:
+        out = subprocess.check_output(["powercfg", "/list"], text=True, stderr=subprocess.DEVNULL)
+    except Exception:
+        return []
+    plans = []
+    for line in out.splitlines():
+        m = re.search(r"Power Scheme GUID:\s+([a-f0-9\-]+)\s+\((.*?)\)(\s*\*|\s*$)", line, re.I)
+        if m:
+            guid = m.group(1).strip()
+            name = m.group(2).strip()
+            is_active = "*" in m.group(3)
+            plans.append({"guid": guid, "name": name, "is_active": is_active})
+    return plans
+
+
+def _compute_md5(fp: str) -> str:
+    h = hashlib.md5()
+    with open(fp, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+@mcp.tool()
+def execute_manifest(manifest: dict[str, Any], dry_run: bool = True) -> dict[str, Any]:
+    """
+    Execute verified archival file mutations (moves, renames, duplicate evacuations)
+    locally on Enforcer with strict reversibility and cryptographic rollback manifests.
+    
+    If dry_run=True (default), verifies all source files exist, hashes match,
+    and target collision checks pass without modifying files.
+    
+    If dry_run=False, moves/renames files, writes a persistent rollback manifest JSON to
+    `D:\\Dev\\act-tracker\\Data\\rollbacks\\` and `D:\\Share\\`, and creates a 1-click Python restore script.
+    """
+    raw_items = manifest.get("items")
+    if not raw_items:
+        if "source" in manifest and "target" in manifest:
+            raw_items = [manifest]
+        else:
+            return {"error": "Manifest must contain an 'items' list with 'source' and 'target' paths."}
+
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    action_type = manifest.get("action", "relocate")
+    reason = manifest.get("reason", "Archival mutation")
+
+    verified_items = []
+    errors = []
+
+    for idx, item in enumerate(raw_items):
+        src = item.get("source") or item.get("source_path")
+        dst = item.get("target") or item.get("target_path")
+        if not src or not dst:
+            errors.append(f"Item #{idx}: missing 'source' or 'target'")
+            continue
+
+        if not os.path.exists(src):
+            errors.append(f"Item #{idx}: source does not exist: {src}")
+            continue
+
+        src_size = os.path.getsize(src)
+        expected_size = item.get("expected_size")
+        if expected_size is not None and src_size != expected_size:
+            errors.append(f"Item #{idx}: size mismatch for {src} (expected {expected_size}, got {src_size})")
+            continue
+
+        expected_md5 = item.get("expected_md5") or item.get("md5")
+        actual_md5 = ""
+        if expected_md5 or not dry_run:
+            actual_md5 = _compute_md5(src)
+            if expected_md5 and actual_md5.lower() != str(expected_md5).lower():
+                errors.append(f"Item #{idx}: MD5 mismatch for {src} (expected {expected_md5}, got {actual_md5})")
+                continue
+
+        if os.path.exists(dst):
+            errors.append(f"Item #{idx}: target collision exists: {dst}")
+            continue
+
+        verified_items.append({
+            "source": src,
+            "target": dst,
+            "size_bytes": src_size,
+            "md5": actual_md5,
+        })
+
+    if errors:
+        return {
+            "status": "validation_failed",
+            "dry_run": dry_run,
+            "verified_count": len(verified_items),
+            "error_count": len(errors),
+            "errors": errors,
+        }
+
+    if dry_run:
+        return {
+            "status": "dry_run_passed",
+            "dry_run": True,
+            "action": action_type,
+            "reason": reason,
+            "items_to_process": len(verified_items),
+            "items": verified_items,
+            "message": "All source paths verified, hashes/sizes matched, zero target collisions. Ready for execution.",
+        }
+
+    # Execute mutations
+    executed = []
+    rollback_records = []
+
+    for item in verified_items:
+        src = item["source"]
+        dst = item["target"]
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.move(src, dst)
+        executed.append({
+            "original_source": src,
+            "current_location": dst,
+            "size_bytes": item["size_bytes"],
+            "md5": item["md5"],
+        })
+        rollback_records.append({
+            "source": dst,
+            "target": src,
+            "size_bytes": item["size_bytes"],
+            "md5": item["md5"],
+        })
+
+    rollback_manifest = {
+        "timestamp": ts,
+        "action": f"rollback_{action_type}",
+        "original_reason": reason,
+        "items": rollback_records,
+    }
+
+    rollback_dir = r"D:\Dev\act-tracker\Data\rollbacks"
+    os.makedirs(rollback_dir, exist_ok=True)
+    mpath = os.path.join(rollback_dir, f"rollback_manifest_{ts}.json")
+    with open(mpath, "w", encoding="utf-8") as f:
+        json.dump(rollback_manifest, f, indent=2)
+
+    share_mpath = os.path.join(r"D:\Share", f"rollback_manifest_{ts}.json")
+    try:
+        shutil.copy2(mpath, share_mpath)
+    except Exception:
+        pass
+
+    rscript_content = f'''"""1-Click Rollback Script for execution {ts}"""
+import json, os, shutil
+
+MANIFEST_PATH = r"{mpath}"
+
+def rollback():
+    with open(MANIFEST_PATH, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    items = manifest.get("items", [])
+    print(f"Rolling back {{len(items)}} items from manifest {ts}...")
+    restored = 0
+    for it in items:
+        src, dst = it["source"], it["target"]
+        if os.path.exists(src):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.move(src, dst)
+            print(f"Restored: {{src}} -> {{dst}}")
+            restored += 1
+        else:
+            print(f"Warning: {{src}} not found!")
+    print(f"Rollback complete: {{restored}}/{{len(items)}} restored.")
+
+if __name__ == "__main__":
+    rollback()
+'''
+    rscript_path = os.path.join(rollback_dir, f"rollback_{ts}.py")
+    with open(rscript_path, "w", encoding="utf-8") as f:
+        f.write(rscript_content)
+    try:
+        shutil.copy2(rscript_path, os.path.join(r"D:\Share", f"rollback_{ts}.py"))
+    except Exception:
+        pass
+
+    return {
+        "status": "success",
+        "dry_run": False,
+        "action": action_type,
+        "reason": reason,
+        "executed_count": len(executed),
+        "rollback_manifest": mpath,
+        "rollback_manifest_share": share_mpath,
+        "rollback_script": rscript_path,
+        "executed_items": executed,
+    }
+
+
+@mcp.tool()
+def enforcer_terminal(command: str, timeout_seconds: int = 60) -> dict[str, Any]:
+    """
+    Execute a PowerShell command directly on Enforcer with local user/admin privileges.
+    Returns returncode, stdout, and stderr.
+    """
+    try:
+        proc = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+        return {
+            "command": command,
+            "returncode": proc.returncode,
+            "stdout": proc.stdout.strip(),
+            "stderr": proc.stderr.strip(),
+        }
+    except subprocess.TimeoutExpired:
+        return {"command": command, "error": f"Command timed out after {timeout_seconds}s"}
+    except Exception as e:
+        return {"command": command, "error": str(e)}
+
+
+@mcp.tool()
+def enforcer_powerplan(action: str = "list", plan: str = "") -> dict[str, Any]:
+    """
+    Manage Windows Power Plans on Enforcer via `powercfg`.
+    - action="list": Lists all power plans, GUIDs, and indicates which one is active (*).
+    - action="set": Activates the power plan matching `plan` (by name substring or GUID).
+    """
+    plans = _get_powerplans()
+    active_plan = next((p for p in plans if p["is_active"]), None)
+
+    if action == "list":
+        return {
+            "active_plan": active_plan,
+            "available_plans": plans,
+        }
+
+    if action == "set":
+        if not plan:
+            return {"error": "Must specify `plan` name or GUID to activate", "available_plans": plans}
+        target = None
+        q = plan.lower().strip()
+        for p in plans:
+            if q == p["guid"].lower() or q == p["name"].lower():
+                target = p
+                break
+        if not target:
+            for p in plans:
+                if q in p["name"].lower() or q in p["guid"].lower():
+                    target = p
+                    break
+        if not target:
+            return {
+                "error": f"No power plan matching '{plan}' found",
+                "available_plans": plans,
+            }
+
+        res = subprocess.run(["powercfg", "/setactive", target["guid"]], capture_output=True, text=True)
+        updated_plans = _get_powerplans()
+        new_active = next((p for p in updated_plans if p["is_active"]), None)
+        return {
+            "success": res.returncode == 0,
+            "activated": target,
+            "active_plan": new_active,
+            "stdout": res.stdout.strip(),
+            "stderr": res.stderr.strip(),
+        }
+
+    return {"error": f"Unknown action '{action}'. Use 'list' or 'set'."}
+
+
+@mcp.tool()
+def enforcer_system_power(action: str = "sleep", delay_seconds: int = 60) -> dict[str, Any]:
+    """
+    Control Enforcer system power state:
+    - action="sleep": Put machine into sleep / standby immediately.
+    - action="shutdown": Schedule a clean Windows shutdown with countdown.
+    - action="restart": Schedule a clean Windows reboot.
+    - action="abort": Cancel a scheduled shutdown or restart.
+    """
+    if action == "sleep":
+        cmd = "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Application]::SetSuspendState([System.Windows.Forms.PowerState]::Suspend, $false, $false)"
+        res = subprocess.run(["powershell.exe", "-NoProfile", "-Command", cmd], capture_output=True, text=True)
+        return {"action": "sleep", "returncode": res.returncode, "stdout": res.stdout.strip(), "stderr": res.stderr.strip()}
+
+    elif action == "shutdown":
+        res = subprocess.run(["shutdown.exe", "/s", "/t", str(delay_seconds), "/c", "Shutdown requested remotely from Aether via FastMCP"], capture_output=True, text=True)
+        return {"action": "shutdown", "delay_seconds": delay_seconds, "returncode": res.returncode, "stdout": res.stdout.strip(), "stderr": res.stderr.strip()}
+
+    elif action == "restart":
+        res = subprocess.run(["shutdown.exe", "/r", "/t", str(delay_seconds), "/c", "Reboot requested remotely from Aether via FastMCP"], capture_output=True, text=True)
+        return {"action": "restart", "delay_seconds": delay_seconds, "returncode": res.returncode, "stdout": res.stdout.strip(), "stderr": res.stderr.strip()}
+
+    elif action == "abort":
+        res = subprocess.run(["shutdown.exe", "/a"], capture_output=True, text=True)
+        return {"action": "abort", "returncode": res.returncode, "stdout": res.stdout.strip(), "stderr": res.stderr.strip()}
+
+    return {"error": f"Unknown action '{action}'. Use 'sleep', 'shutdown', 'restart', or 'abort'."}
+
+
+@mcp.tool()
+def enforcer_watchdog_config(
+    enabled: bool | None = None,
+    idle_minutes: int | None = None,
+    sleep_plan: str | None = None,
+) -> dict[str, Any]:
+    """
+    Configure or inspect the Enforcer MCP inactivity watchdog.
+    When enabled, switches to `sleep_plan` if no FastMCP requests arrive for `idle_minutes`.
+    """
+    global _WATCHDOG_CONFIG
+    if enabled is not None:
+        _WATCHDOG_CONFIG["enabled"] = bool(enabled)
+    if idle_minutes is not None and idle_minutes > 0:
+        _WATCHDOG_CONFIG["idle_timeout_seconds"] = int(idle_minutes * 60)
+    if sleep_plan is not None:
+        plans = _get_powerplans()
+        target = None
+        q = sleep_plan.lower().strip()
+        for p in plans:
+            if q == p["guid"].lower() or q == p["name"].lower() or q in p["name"].lower():
+                target = p
+                break
+        if target:
+            _WATCHDOG_CONFIG["sleep_plan_guid"] = target["guid"]
+            _WATCHDOG_CONFIG["sleep_plan_name"] = target["name"]
+        else:
+            return {"error": f"Could not find power plan matching '{sleep_plan}'", "config": _WATCHDOG_CONFIG}
+
+    idle_seconds_current = round(time.time() - _LAST_ACTIVITY_TIME, 1)
+    return {
+        "watchdog_config": {
+            "enabled": _WATCHDOG_CONFIG["enabled"],
+            "idle_timeout_minutes": _WATCHDOG_CONFIG["idle_timeout_seconds"] / 60,
+            "sleep_plan_name": _WATCHDOG_CONFIG["sleep_plan_name"],
+            "sleep_plan_guid": _WATCHDOG_CONFIG["sleep_plan_guid"],
+        },
+        "seconds_since_last_activity": idle_seconds_current,
+    }
+
+
+def _watchdog_loop() -> None:
+    while True:
+        try:
+            time.sleep(30)
+            if not _WATCHDOG_CONFIG.get("enabled"):
+                continue
+            timeout = _WATCHDOG_CONFIG.get("idle_timeout_seconds", 900)
+            target_guid = _WATCHDOG_CONFIG.get("sleep_plan_guid")
+            if not target_guid:
+                continue
+
+            idle = time.time() - _LAST_ACTIVITY_TIME
+            if idle >= timeout:
+                plans = _get_powerplans()
+                active = next((p for p in plans if p["is_active"]), None)
+                if active and active["guid"].lower() != target_guid.lower():
+                    logger.warning(
+                        "[Watchdog] Inactivity timeout reached (idle %.0fs >= %ds). Switching powerplan to '%s' (%s)",
+                        idle, timeout, _WATCHDOG_CONFIG.get("sleep_plan_name"), target_guid
+                    )
+                    subprocess.run(["powercfg", "/setactive", target_guid], capture_output=True, text=True)
+        except Exception:
+            pass
+
+
+_watchdog_thread = threading.Thread(target=_watchdog_loop, daemon=True)
+_watchdog_thread.start()
 
 
 @mcp.tool()
@@ -649,6 +1033,9 @@ class _AcceptHeaderNormalizer:
         if scope.get("type") != "http":
             await self.inner_app(scope, receive, send)
             return
+
+        global _LAST_ACTIVITY_TIME
+        _LAST_ACTIVITY_TIME = time.time()
 
         headers = list(scope.get("headers", []))
         new_headers = [(k, v) for k, v in headers if k.lower() != b"accept"]
