@@ -421,29 +421,111 @@ def enforcer_list_staging(
 
 
 @mcp.tool()
-async def ask_clio_on_enforcer(task_prompt: str) -> str:
+def enforcer_sql_query(database: str = "marvel_kb", sql_query: str = "SELECT * FROM volume_summaries LIMIT 10") -> dict[str, Any]:
     """
-    Spawn an autonomous read-only Clio subagent locally on Enforcer via `google.antigravity` SDK.
+    Execute a strictly READ-ONLY SQLite SELECT query on Enforcer's local `marvel_kb` (`marvel_kb.db`)
+    or `comics` (`comics.db`) database so Clio on Aether (running on Google AI Pro) can inspect any table directly.
     """
-    from google.antigravity import Agent, CapabilitiesConfig, LocalAgentConfig
+    q_strip = sql_query.strip()
+    if not re.match(r"^(SELECT|WITH|PRAGMA)\b", q_strip, re.I):
+        return {"error": "Only read-only SELECT / WITH / PRAGMA queries are permitted."}
 
-    sys_prompt = "You are Clio, Muse of History and Archival Curator. Strictly read-only."
-    if os.path.exists(CLIO_SKILL_PATH):
-        with open(CLIO_SKILL_PATH, "r", encoding="utf-8") as f:
-            sys_prompt = f.read()
+    db_target = KB_DB_PATH if database.lower() in ("marvel_kb", "kb", "marvel") else COMICS_DB_PATH
+    if not os.path.exists(db_target):
+        return {"error": f"Database not found: {db_target}"}
 
-    os.makedirs(r"D:\Temp\antigravity_clio", exist_ok=True)
-    config = LocalAgentConfig(
-        system_instructions=sys_prompt,
-        capabilities=CapabilitiesConfig(),
-        save_dir=r"D:\Temp\antigravity_clio",
-    )
-    chunks: list[str] = []
-    async with Agent(config) as clio:
-        response = await clio.chat(task_prompt)
-        async for token in response:
-            chunks.append(token)
-    return "".join(chunks)
+    try:
+        conn = sqlite3.connect(f"file:{db_target}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(q_strip).fetchmany(250)
+        data = [dict(r) for r in rows]
+        conn.close()
+        return {"database": database, "row_count": len(data), "rows": data}
+    except Exception as e:
+        return {"database": database, "error": str(e)}
+
+
+@mcp.tool()
+def enforcer_batch_audit_files(
+    subfolder: str = "Marvel",
+    limit: int = 50,
+    offset: int = 0,
+    filter_substring: str = "",
+    exclude_omnibus_epic: bool = True,
+) -> dict[str, Any]:
+    """
+    High-speed local archival pre-enrichment on Enforcer (zero API cost).
+    Scans up to `limit` comic files in `S:\\Agile Comic Tracker\\<subfolder>`, computes `.cbz` TOC
+    page counts (`< 2 ms/file`), parses with `act-tracker`'s `parser.py`, and attaches matching
+    `marvel_kb.db` volumes, `reprint_of_json` TPB contents, and `comics.db` master runs so
+    Clio on Aether (running on your Google AI Pro subscription) can audit & propose renames directly!
+    """
+    _ensure_kb_cache()
+    from src.core.parser import parse_incoming_file
+    from src.core.rename_cleaner import scrub_release_groups
+
+    target_dir = os.path.join(STAGING_ROOT, subfolder)
+    if not os.path.exists(target_dir):
+        return {"exists": False, "target_dir": target_dir}
+
+    candidates: list[tuple[str, str, str]] = []
+    for root, _dirs, files in os.walk(target_dir):
+        rel_folder = os.path.relpath(root, target_dir)
+        parent_label = f"[Root: {subfolder}]" if rel_folder == "." else rel_folder
+        for fn in sorted(files):
+            ext = os.path.splitext(fn)[1].lower()
+            if ext not in (".cbz", ".cbr"):
+                continue
+            fn_low = fn.lower()
+            if exclude_omnibus_epic and any(k in fn_low for k in ("omnibus", "epic collection", "masterworks")):
+                continue
+            if filter_substring and filter_substring.lower() not in f"{parent_label}/{fn}".lower():
+                continue
+            candidates.append((parent_label, fn, os.path.join(root, fn)))
+
+    sliced = candidates[offset : offset + limit]
+    enriched = []
+    for parent_label, fn, fp in sliced:
+        size_mb = round(os.path.getsize(fp) / (1024 * 1024), 2)
+        pages = max(1, int(round(size_mb / 1.65)))
+        mode = "SIZE_EST"
+        if fn.lower().endswith(".cbz"):
+            try:
+                with zipfile.ZipFile(fp, "r") as zf:
+                    imgs = [n for n in zf.namelist() if re.search(r"\.(jpg|jpeg|png|webp|gif)$", n, re.I)]
+                    if imgs:
+                        pages = len(imgs)
+                        mode = "CBZ_TOC"
+            except Exception:
+                pass
+
+        parsed = parse_incoming_file(fn, target_dir, f"[{subfolder}]")
+        stitle = parsed.get("series_title") or ""
+        f_year = parsed.get("year")
+        f_iss = parsed.get("issue_number")
+        vol_info = marvel_resolve_volume(stitle, year=f_year, issue_number=f_iss) if stitle else {}
+        tpb_info = marvel_resolve_tpb(stitle or fn, year=f_year) if (parsed.get("is_tpb") or pages >= 80) else {}
+
+        enriched.append({
+            "parent_folder": parent_label,
+            "filename": fn,
+            "scrubbed_filename": scrub_release_groups(fn),
+            "size_mb": size_mb,
+            "pages": pages,
+            "page_mode": mode,
+            "parsed": parsed,
+            "kb_best_volumes": vol_info.get("best_matches", [])[:5],
+            "comics_db_runs": vol_info.get("comics_db_runs", []),
+            "kb_tpb_matches": tpb_info.get("matches", [])[:5],
+        })
+
+    return {
+        "subfolder": subfolder,
+        "total_matching_files": len(candidates),
+        "offset": offset,
+        "returned_count": len(enriched),
+        "items": enriched,
+    }
 
 
 # Expose ASGI app at module level so `uvicorn` can import `"server:app"` with `reload=True`
