@@ -435,6 +435,7 @@ _SECURITY = TransportSecuritySettings(enable_dns_rebinding_protection=False)
 _mcp_starlette = mcp.streamable_http_app(
     streamable_http_path="/mcp",
     json_response=True,
+    stateless_http=True,
     transport_security=_SECURITY,
     host=_HOST,
 )
