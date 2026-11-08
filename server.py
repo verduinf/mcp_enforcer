@@ -27,6 +27,21 @@ for p in (MCP_ROOT, ACT_ROOT, RAG_ROOT):
     if p not in sys.path and os.path.exists(p):
         sys.path.insert(0, p)
 
+# Keep temporary agent session files off C:\
+os.makedirs(r"D:\Temp", exist_ok=True)
+os.environ.setdefault("TMP", r"D:\Temp")
+os.environ.setdefault("TEMP", r"D:\Temp")
+
+# Auto-load API keys (GEMINI_API_KEY, OPENROUTER_API_KEY, GROQ_API_KEY, etc.) from .env files
+for _env_path in (os.path.join(ACT_ROOT, ".env"), os.path.join(MCP_ROOT, ".env")):
+    if os.path.exists(_env_path):
+        with open(_env_path, "r", encoding="utf-8") as _ef:
+            for _line in _ef:
+                _line = _line.strip()
+                if _line and not _line.startswith("#") and "=" in _line:
+                    _k, _v = _line.split("=", 1)
+                    os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
+
 KB_DB_PATH = r"D:\Dev\marvel_rag\data\marvel_kb.db"
 VECTORS_PATH = r"D:\Dev\marvel_rag\data\vectors.f16.npy"
 COMICS_DB_PATH = r"S:\Agile Comic Tracker\Data\comics.db"
@@ -417,9 +432,11 @@ async def ask_clio_on_enforcer(task_prompt: str) -> str:
         with open(CLIO_SKILL_PATH, "r", encoding="utf-8") as f:
             sys_prompt = f.read()
 
+    os.makedirs(r"D:\Temp\antigravity_clio", exist_ok=True)
     config = LocalAgentConfig(
         system_instructions=sys_prompt,
         capabilities=CapabilitiesConfig(),
+        save_dir=r"D:\Temp\antigravity_clio",
     )
     chunks: list[str] = []
     async with Agent(config) as clio:
