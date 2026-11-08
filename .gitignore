@@ -1,0 +1,12 @@
+# TLS Certificates & Private Keys (NEVER COMMIT)
+certs/
+*.crt
+*.key
+*.pem
+
+# Python / Virtualenv
+__pycache__/
+*.py[codz]
+.venv/
+venv/
+.env
