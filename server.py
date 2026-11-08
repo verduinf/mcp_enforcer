@@ -144,6 +144,13 @@ def enforcer_git_sync(repo: str = "all") -> dict[str, Any]:
                 "stdout": proc.stdout.strip(),
                 "stderr": proc.stderr.strip(),
             }
+            if name == "act-tracker" and proc.returncode == 0:
+                act_mcp_srv = os.path.join(ACT_ROOT, "mcp_enforcer", "server.py")
+                local_srv = os.path.join(MCP_ROOT, "server.py")
+                if os.path.exists(act_mcp_srv) and os.path.abspath(act_mcp_srv) != os.path.abspath(local_srv):
+                    import shutil
+                    shutil.copy2(act_mcp_srv, local_srv)
+                    results["mirrored_to_mcp_enforcer"] = True
         except Exception as e:
             results[name] = {"error": str(e)}
     return {
@@ -376,11 +383,30 @@ async def ask_clio_on_enforcer(task_prompt: str) -> str:
 # Expose ASGI app at module level so `uvicorn` can import `"server:app"` with `reload=True`
 _HOST = os.environ.get("ENFORCER_MCP_HOST", "0.0.0.0")
 _SECURITY = TransportSecuritySettings(enable_dns_rebinding_protection=False)
-app = mcp.streamable_http_app(
+_mcp_starlette = mcp.streamable_http_app(
     streamable_http_path="/mcp",
+    json_response=True,
     transport_security=_SECURITY,
     host=_HOST,
 )
+
+
+class _AcceptHeaderNormalizer:
+    """Ensures MCP clients sending only `Accept: application/json` (or no Accept header) never get 406 Not Acceptable."""
+
+    def __init__(self, inner_app: Any) -> None:
+        self.inner_app = inner_app
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") == "http":
+            headers = list(scope.get("headers", []))
+            new_headers = [(k, v) for k, v in headers if k.lower() != b"accept"]
+            new_headers.append((b"accept", b"application/json, text/event-stream"))
+            scope = dict(scope, headers=new_headers)
+        await self.inner_app(scope, receive, send)
+
+
+app = _AcceptHeaderNormalizer(_mcp_starlette)
 
 
 def main() -> None:
