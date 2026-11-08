@@ -305,15 +305,21 @@ def enforcer_git_sync(repo: str = "all") -> dict[str, Any]:
 
 @mcp.tool()
 def marvel_resolve_volume(
-    series_title: str,
+    series_title: str = "",
+    title: str = "",
     year: int | None = None,
     issue_number: int | None = None,
+    issue: int | None = None,
 ) -> dict[str, Any]:
     """
     Resolve canonical Marvel volume (vN), publication year bounds, issue count,
     and master archive (comics.db) continuity for a series title on Enforcer.
+    Accepts either `series_title` or `title` (and `issue_number` or `issue`).
     """
     _ensure_kb_cache()
+    series_title = (series_title or title or "").strip()
+    if issue_number is None and issue is not None:
+        issue_number = issue
     norm = _norm_title(series_title)
     norm_no_the = _norm_title(re.sub(r"^the\s+", "", series_title, flags=re.I))
 
@@ -369,12 +375,19 @@ def marvel_resolve_volume(
 
 
 @mcp.tool()
-def marvel_resolve_tpb(search_title: str, year: int | None = None) -> dict[str, Any]:
+def marvel_resolve_tpb(
+    search_title: str = "",
+    title: str = "",
+    series_title: str = "",
+    year: int | None = None,
+) -> dict[str, Any]:
     """
     Query `issue_continuity.reprint_of_json` (18,743 collected editions) in `marvel_kb.db`
     to find exact collected issues, contiguous vs. non-contiguous ranges, and parent volumes.
+    Accepts `search_title`, `title`, or `series_title`.
     """
     _ensure_kb_cache()
+    search_title = (search_title or title or series_title or "").strip()
     tokens = [t for t in _norm_title(search_title).split() if t not in {"tpb", "vol", "v", "the", "of", "and"}]
     matches = []
     for k, rows in _KB_CACHE["reprints_by_title"].items():
