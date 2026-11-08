@@ -104,7 +104,7 @@ def _setup_rolling_logger() -> logging.Logger:
         handler = TimestampedRollingLogHandler()
         handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
         root_logger.addHandler(handler)
-        for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access", "mcp"):
+        for logger_name in ("uvicorn.error", "uvicorn.access", "mcp"):
             lg = logging.getLogger(logger_name)
             lg.setLevel(logging.INFO)
             if not any(isinstance(h, TimestampedRollingLogHandler) for h in lg.handlers):
