@@ -52,5 +52,7 @@ Exposes **Enforcer's** local Marvel Knowledge Base (`marvel_kb.db` + `vectors.f1
 - **`marvel_hybrid_search(query, top_k=5)`** — Runs hybrid FTS5 lexical + BGE-small dense vector search (`vectors.f16.npy`) on Enforcer.
 - **`enforcer_inspect_archive(file_path)`** — Reads `.cbz` Central Directory TOC page counts (`< 2 ms`) and file size directly on `S:\Agile Comic Tracker` without SMB transfer.
 - **`enforcer_list_staging(subfolder="Marvel", filter_substring="", limit=100)`** — Lists set folders and files in `S:\Agile Comic Tracker\<subfolder>`.
-- **`ask_clio_on_enforcer(task_prompt)`** — Spawns a local read-only Clio subagent on Enforcer via `google.antigravity`.
+- **`enforcer_batch_audit_files(subfolder="Marvel", limit=50, offset=0, filter_substring="", exclude_omnibus_epic=True)`** — Zero-API-cost batch enrichment: walks `S:\Agile Comic Tracker\<subfolder>`, computes `.cbz` TOC page counts, runs `act-tracker`'s `parser.py` + `scrub_release_groups()`, and attaches `marvel_kb.db` volumes, `reprint_of_json` TPB contents, and `comics.db` runs for Clio on **Aether** (running on Google AI Pro).
+- **`enforcer_sql_query(database="marvel_kb", sql_query="SELECT ...")`** — Executes read-only `SELECT` queries against Enforcer's `marvel_kb.db` or `comics.db`.
+- **`enforcer_git_sync(repo="all")`** — Pulls latest commits from `origin/main` on Enforcer so Uvicorn `--reload` hot-reloads any `.py` changes.
 
