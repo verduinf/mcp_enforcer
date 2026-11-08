@@ -144,13 +144,6 @@ def enforcer_git_sync(repo: str = "all") -> dict[str, Any]:
                 "stdout": proc.stdout.strip(),
                 "stderr": proc.stderr.strip(),
             }
-            if name == "act-tracker" and proc.returncode == 0:
-                act_mcp_srv = os.path.join(ACT_ROOT, "mcp_enforcer", "server.py")
-                local_srv = os.path.join(MCP_ROOT, "server.py")
-                if os.path.exists(act_mcp_srv) and os.path.abspath(act_mcp_srv) != os.path.abspath(local_srv):
-                    import shutil
-                    shutil.copy2(act_mcp_srv, local_srv)
-                    results["mirrored_to_mcp_enforcer"] = True
         except Exception as e:
             results[name] = {"error": str(e)}
     return {
