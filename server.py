@@ -7,12 +7,16 @@ git hot-sync (`enforcer_git_sync`), and optional local Clio subagent invocation
 over TLS (`https://192.168.178.36:8765/mcp`) with Uvicorn `--reload` auto-discovery.
 """
 
+import datetime
+import glob
 import json
+import logging
 import os
 import re
 import sqlite3
 import subprocess
 import sys
+import threading
 import zipfile
 from typing import Any
 
@@ -23,6 +27,10 @@ from mcp.server.transport_security import TransportSecuritySettings
 MCP_ROOT = r"D:\Dev\mcp_enforcer"
 ACT_ROOT = r"D:\Dev\act-tracker"
 RAG_ROOT = r"D:\Dev\marvel_rag"
+LOG_DIR = r"D:\Share\mcp_enforcer_logs"
+MAX_LOG_BYTES = 5 * 1024  # 5 KB per file
+MAX_LOG_FILES = 100       # Max 100 rolling timestamped files kept
+
 for p in (MCP_ROOT, ACT_ROOT, RAG_ROOT):
     if p not in sys.path and os.path.exists(p):
         sys.path.insert(0, p)
@@ -31,6 +39,81 @@ for p in (MCP_ROOT, ACT_ROOT, RAG_ROOT):
 os.makedirs(r"D:\Temp", exist_ok=True)
 os.environ.setdefault("TMP", r"D:\Temp")
 os.environ.setdefault("TEMP", r"D:\Temp")
+
+
+class TimestampedRollingLogHandler(logging.Handler):
+    """
+    Writes logs into `D:\\Share\\mcp_enforcer_logs\\mcp_enforcer_<YYYYMMDD_HHMMSS_mmm>.log`.
+    Rolls over to a new timestamped file whenever file size reaches 5 KB (5,120 bytes)
+    and prunes oldest files so at most 100 files are kept on disk.
+    """
+
+    def __init__(self, log_dir: str = LOG_DIR, max_bytes: int = MAX_LOG_BYTES, backup_count: int = MAX_LOG_FILES) -> None:
+        super().__init__()
+        self.log_dir = log_dir
+        self.max_bytes = max_bytes
+        self.backup_count = backup_count
+        self._lock = threading.RLock()
+        self._current_path: str | None = None
+        self._current_size: int = 0
+        self._seq: int = 0
+        os.makedirs(self.log_dir, exist_ok=True)
+        self._open_new_chunk()
+
+    def _open_new_chunk(self) -> None:
+        now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        self._seq = (self._seq + 1) % 1000
+        fname = f"mcp_enforcer_{now}_{self._seq:03d}.log"
+        self._current_path = os.path.join(self.log_dir, fname)
+        self._current_size = 0
+        self._prune_old_files()
+
+    def _prune_old_files(self) -> None:
+        try:
+            pattern = os.path.join(self.log_dir, "mcp_enforcer_*.log")
+            files = sorted(glob.glob(pattern), key=lambda p: os.path.getmtime(p))
+            while len(files) >= self.backup_count:
+                oldest = files.pop(0)
+                try:
+                    os.remove(oldest)
+                except OSError:
+                    pass
+        except Exception:
+            pass
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record) + "\n"
+            encoded = msg.encode("utf-8", errors="replace")
+            with self._lock:
+                if self._current_path is None or (
+                    self._current_size > 0 and self._current_size + len(encoded) > self.max_bytes
+                ):
+                    self._open_new_chunk()
+                with open(self._current_path, "ab") as f:
+                    f.write(encoded)
+                self._current_size += len(encoded)
+        except Exception:
+            self.handleError(record)
+
+
+def _setup_rolling_logger() -> logging.Logger:
+    root_logger = logging.getLogger("enforcer_mcp")
+    root_logger.setLevel(logging.INFO)
+    if not any(isinstance(h, TimestampedRollingLogHandler) for h in root_logger.handlers):
+        handler = TimestampedRollingLogHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+        root_logger.addHandler(handler)
+        for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access", "mcp"):
+            lg = logging.getLogger(logger_name)
+            lg.setLevel(logging.INFO)
+            if not any(isinstance(h, TimestampedRollingLogHandler) for h in lg.handlers):
+                lg.addHandler(handler)
+    return root_logger
+
+
+logger = _setup_rolling_logger()
+logger.info("Enforcer MCP rolling logger initialized in %s (max_bytes=%d, max_files=%d)", LOG_DIR, MAX_LOG_BYTES, MAX_LOG_FILES)
 
 # Auto-load API keys (GEMINI_API_KEY, OPENROUTER_API_KEY, GROQ_API_KEY, etc.) from .env files
 for _env_path in (os.path.join(ACT_ROOT, ".env"), os.path.join(MCP_ROOT, ".env")):
@@ -541,18 +624,68 @@ _mcp_starlette = mcp.streamable_http_app(
 
 
 class _AcceptHeaderNormalizer:
-    """Ensures MCP clients sending only `Accept: application/json` (or no Accept header) never get 406 Not Acceptable."""
+    """
+    1. Ensures MCP clients sending only `Accept: application/json` never get 406 Not Acceptable.
+    2. Logs every incoming HTTP / JSON-RPC tool call and response status to `D:\\Share\\mcp_enforcer_logs`.
+    """
 
     def __init__(self, inner_app: Any) -> None:
         self.inner_app = inner_app
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
-        if scope.get("type") == "http":
-            headers = list(scope.get("headers", []))
-            new_headers = [(k, v) for k, v in headers if k.lower() != b"accept"]
-            new_headers.append((b"accept", b"application/json, text/event-stream"))
-            scope = dict(scope, headers=new_headers)
-        await self.inner_app(scope, receive, send)
+        if scope.get("type") != "http":
+            await self.inner_app(scope, receive, send)
+            return
+
+        headers = list(scope.get("headers", []))
+        new_headers = [(k, v) for k, v in headers if k.lower() != b"accept"]
+        new_headers.append((b"accept", b"application/json, text/event-stream"))
+        scope = dict(scope, headers=new_headers)
+
+        client = scope.get("client") or ("unknown", 0)
+        method = scope.get("method", "POST")
+        path = scope.get("path", "/mcp")
+        body_chunks: list[bytes] = []
+        status_code_holder: list[int] = [0]
+
+        async def wrapped_receive() -> dict[str, Any]:
+            msg = await receive()
+            if msg.get("type") == "http.request":
+                body_chunks.append(msg.get("body", b""))
+            return msg
+
+        async def wrapped_send(msg: dict[str, Any]) -> None:
+            if msg.get("type") == "http.response.start":
+                status_code_holder[0] = msg.get("status", 0)
+            await send(msg)
+
+        try:
+            await self.inner_app(scope, wrapped_receive, wrapped_send)
+        except Exception:
+            logger.exception("Unhandled exception on %s %s from %s:%s", method, path, client[0], client[1])
+            raise
+        finally:
+            raw_body = b"".join(body_chunks).decode("utf-8", errors="replace")
+            rpc_summary = ""
+            if raw_body:
+                try:
+                    j = json.loads(raw_body)
+                    rpc_method = j.get("method", "")
+                    params = j.get("params") or {}
+                    tool_name = params.get("name", "") if isinstance(params, dict) else ""
+                    tool_args = params.get("arguments", {}) if isinstance(params, dict) else {}
+                    rpc_summary = f" rpc={rpc_method}" + (f" tool={tool_name} args={json.dumps(tool_args)[:300]}" if tool_name else "")
+                except Exception:
+                    rpc_summary = f" body={raw_body[:200]}"
+            logger.info(
+                "%s:%s - \"%s %s\" %d%s",
+                client[0],
+                client[1],
+                method,
+                path,
+                status_code_holder[0],
+                rpc_summary,
+            )
 
 
 app = _AcceptHeaderNormalizer(_mcp_starlette)
