@@ -64,27 +64,78 @@ def _ensure_kb_cache() -> None:
     conn = sqlite3.connect(f"file:{KB_DB_PATH}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
 
-    vols_by_title: dict[str, list[dict[str, Any]]] = {}
-    for row in conn.execute(
-        "SELECT volume_page_id, series_title, volume_number, start_year, end_year, issue_count, format, summary_text "
-        "FROM volume_summaries"
-    ):
-        d = dict(row)
-        raw_t = d["series_title"] or ""
-        base_t = re.sub(r"\s+Vol\s+\d+.*$", "", raw_t, flags=re.I).strip()
-        for variant in {_norm_title(base_t), _norm_title(re.sub(r"^the\s+", "", base_t, flags=re.I))}:
-            if variant:
-                vols_by_title.setdefault(variant, []).append(d)
-
+    # Pre-compute min_year, max_year, and issue_count per (series, volume) from issue_continuity
+    vol_stats: dict[tuple[str, int], dict[str, Any]] = {}
     reprints_by_title: dict[str, list[dict[str, Any]]] = {}
+
     for row in conn.execute(
-        "SELECT page_id, title, series_title, volume_number, issue_number, release_year, reprint_of_json, events_json "
-        "FROM issue_continuity WHERE reprint_of_json IS NOT NULL AND reprint_of_json != '[]'"
+        "SELECT title, series, volume, issue, legacy_number, release_date, year, reprint_of_json, events_json "
+        "FROM issue_continuity"
+    ):
+        ser = (row["series"] or "").strip()
+        vol = row["volume"] if row["volume"] is not None else 1
+        yr = row["year"]
+        key = (ser.lower(), int(vol))
+        st = vol_stats.get(key)
+        if st is None:
+            st = {"series": ser, "volume": int(vol), "start_year": yr, "end_year": yr, "issue_count": 0}
+            vol_stats[key] = st
+        st["issue_count"] += 1
+        if yr is not None:
+            if st["start_year"] is None or yr < st["start_year"]:
+                st["start_year"] = yr
+            if st["end_year"] is None or yr > st["end_year"]:
+                st["end_year"] = yr
+
+        rep_raw = row["reprint_of_json"]
+        if rep_raw and rep_raw != "[]":
+            d = dict(row)
+            t_norm = _norm_title(d["title"] or "")
+            if t_norm:
+                reprints_by_title.setdefault(t_norm, []).append(d)
+
+    vols_by_title: dict[str, list[dict[str, Any]]] = {}
+    seen_vol_keys: set[tuple[str, int]] = set()
+    for row in conn.execute(
+        "SELECT title, series, volume, format, status, writers_json, parts_notes_json FROM volume_summaries"
     ):
         d = dict(row)
-        t_norm = _norm_title(d["title"] or "")
-        if t_norm:
-            reprints_by_title.setdefault(t_norm, []).append(d)
+        ser = (d["series"] or "").strip()
+        vol = int(d["volume"]) if d["volume"] is not None else 1
+        key = (ser.lower(), vol)
+        seen_vol_keys.add(key)
+        st = vol_stats.get(key, {})
+        entry = {
+            "volume_title": d["title"],
+            "series_title": ser,
+            "volume_number": vol,
+            "start_year": st.get("start_year"),
+            "end_year": st.get("end_year"),
+            "issue_count": st.get("issue_count", 0),
+            "format": d["format"],
+            "status": d["status"],
+        }
+        for variant in {_norm_title(ser), _norm_title(re.sub(r"^the\s+", "", ser, flags=re.I))}:
+            if variant:
+                vols_by_title.setdefault(variant, []).append(entry)
+
+    # Also include any (series, volume) present in issue_continuity but missing from volume_summaries
+    for key, st in vol_stats.items():
+        if key not in seen_vol_keys and st["series"]:
+            ser = st["series"]
+            entry = {
+                "volume_title": f"{ser} Vol {st['volume']}",
+                "series_title": ser,
+                "volume_number": st["volume"],
+                "start_year": st["start_year"],
+                "end_year": st["end_year"],
+                "issue_count": st["issue_count"],
+                "format": None,
+                "status": None,
+            }
+            for variant in {_norm_title(ser), _norm_title(re.sub(r"^the\s+", "", ser, flags=re.I))}:
+                if variant:
+                    vols_by_title.setdefault(variant, []).append(entry)
 
     conn.close()
     _KB_CACHE["volumes_by_title"] = vols_by_title
@@ -229,14 +280,16 @@ def marvel_resolve_tpb(search_title: str, year: int | None = None) -> dict[str, 
     for k, rows in _KB_CACHE["reprints_by_title"].items():
         if all(tok in k for tok in tokens):
             for r in rows:
-                if year is None or not r.get("release_year") or abs(int(r["release_year"]) - year) <= 2:
+                ry = r.get("year")
+                if year is None or not ry or abs(int(ry) - year) <= 2:
                     reprints = json.loads(r["reprint_of_json"] or "[]")
                     matches.append({
                         "title": r["title"],
-                        "series_title": r["series_title"],
-                        "volume_number": r["volume_number"],
-                        "issue_number": r["issue_number"],
-                        "release_year": r["release_year"],
+                        "series_title": r.get("series"),
+                        "volume_number": r.get("volume"),
+                        "issue_number": r.get("issue"),
+                        "release_year": ry,
+                        "release_date": r.get("release_date"),
                         "collected_issues": reprints,
                     })
     matches.sort(key=lambda x: (x.get("release_year") or 0, x.get("title") or ""))
