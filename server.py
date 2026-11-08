@@ -704,9 +704,31 @@ class _AcceptHeaderNormalizer:
 app = _AcceptHeaderNormalizer(_mcp_starlette)
 
 
+def _terminate_existing_instances(port: int = 8765) -> None:
+    """Terminates any previous mcp_enforcer instance bound to `port` before starting a new parent server."""
+    my_pid = os.getpid()
+    parent_pid = os.getppid()
+    try:
+        out = subprocess.check_output(["netstat", "-aon"], text=True, stderr=subprocess.DEVNULL)
+        for line in out.splitlines():
+            if f":{port}" in line and "LISTENING" in line:
+                parts = line.split()
+                if parts and parts[-1].isdigit():
+                    old_pid = int(parts[-1])
+                    if old_pid not in (0, my_pid, parent_pid):
+                        subprocess.run(
+                            ["taskkill", "/F", "/T", "/PID", str(old_pid)],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+    except Exception:
+        pass
+
+
 def main() -> None:
     host = _HOST
     port = int(os.environ.get("ENFORCER_MCP_PORT", "8765"))
+    _terminate_existing_instances(port)
     cert_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs")
     cert_file = os.path.join(cert_dir, "enforcer.crt")
     key_file = os.path.join(cert_dir, "enforcer.key")
