@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 import zipfile
+from dataclasses import dataclass
 from typing import Any
 
 import uvicorn
@@ -169,6 +170,15 @@ def _norm_title(s: str) -> str:
     return s
 
 
+@dataclass
+class VolumeStat:
+    series: str
+    volume: int
+    start_year: int | None = None
+    end_year: int | None = None
+    issue_count: int = 0
+
+
 def _ensure_kb_cache() -> None:
     if _KB_CACHE["loaded"] or not os.path.exists(KB_DB_PATH):
         return
@@ -176,7 +186,7 @@ def _ensure_kb_cache() -> None:
     conn.row_factory = sqlite3.Row
 
     # Pre-compute min_year, max_year, and issue_count per (series, volume) from issue_continuity
-    vol_stats: dict[tuple[str, int], dict[str, Any]] = {}
+    vol_stats: dict[tuple[str, int], VolumeStat] = {}
     reprints_by_title: dict[str, list[dict[str, Any]]] = {}
 
     for row in conn.execute(
@@ -191,14 +201,14 @@ def _ensure_kb_cache() -> None:
         key = (ser.lower(), vol)
         st = vol_stats.get(key)
         if st is None:
-            st = {"series": ser, "volume": vol, "start_year": yr, "end_year": yr, "issue_count": 0}
+            st = VolumeStat(series=ser, volume=vol, start_year=yr, end_year=yr, issue_count=0)
             vol_stats[key] = st
-        st["issue_count"] += 1
+        st.issue_count += 1
         if yr is not None:
-            if st["start_year"] is None or yr < st["start_year"]:
-                st["start_year"] = yr
-            if st["end_year"] is None or yr > st["end_year"]:
-                st["end_year"] = yr
+            if st.start_year is None or yr < st.start_year:
+                st.start_year = yr
+            if st.end_year is None or yr > st.end_year:
+                st.end_year = yr
 
         rep_raw = row["reprint_of_json"]
         if rep_raw and rep_raw != "[]":
@@ -217,14 +227,14 @@ def _ensure_kb_cache() -> None:
         vol = int(d["volume"]) if d["volume"] is not None else 1
         key = (ser.lower(), vol)
         seen_vol_keys.add(key)
-        st = vol_stats.get(key, {})
+        st = vol_stats.get(key)
         entry = {
             "volume_title": d["title"],
             "series_title": ser,
             "volume_number": vol,
-            "start_year": st.get("start_year"),
-            "end_year": st.get("end_year"),
-            "issue_count": st.get("issue_count", 0),
+            "start_year": st.start_year if st else None,
+            "end_year": st.end_year if st else None,
+            "issue_count": st.issue_count if st else 0,
             "format": d["format"],
             "status": d["status"],
         }
@@ -234,15 +244,15 @@ def _ensure_kb_cache() -> None:
 
     # Also include any (series, volume) present in issue_continuity but missing from volume_summaries
     for key, st in vol_stats.items():
-        if key not in seen_vol_keys and st["series"]:
-            ser = st["series"]
+        if key not in seen_vol_keys and st.series:
+            ser = st.series
             entry = {
-                "volume_title": f"{ser} Vol {st['volume']}",
+                "volume_title": f"{ser} Vol {st.volume}",
                 "series_title": ser,
-                "volume_number": st["volume"],
-                "start_year": st["start_year"],
-                "end_year": st["end_year"],
-                "issue_count": st["issue_count"],
+                "volume_number": st.volume,
+                "start_year": st.start_year,
+                "end_year": st.end_year,
+                "issue_count": st.issue_count,
                 "format": None,
                 "status": None,
             }
@@ -639,9 +649,9 @@ def enforcer_watchdog_config(
     """
     global _WATCHDOG_CONFIG
     if enabled is not None:
-        _WATCHDOG_CONFIG["enabled"] = bool(enabled)
+        _WATCHDOG_CONFIG["enabled"] = enabled
     if idle_minutes is not None and idle_minutes > 0:
-        _WATCHDOG_CONFIG["idle_timeout_seconds"] = int(idle_minutes * 60)
+        _WATCHDOG_CONFIG["idle_timeout_seconds"] = idle_minutes * 60
     if sleep_plan is not None:
         plans = _get_powerplans()
         target = None
@@ -789,7 +799,7 @@ def marvel_resolve_tpb(
             for r in rows:
                 ry_raw = r.get("year")
                 ry = int(ry_raw) if str(ry_raw or "").isdigit() else None
-                if year is None or ry is None or abs(ry - int(year)) <= 2:
+                if year is None or ry is None or abs(ry - year) <= 2:
                     reprints = json.loads(r["reprint_of_json"] or "[]")
                     matches.append({
                         "title": r["title"],
@@ -861,9 +871,9 @@ def enforcer_inspect_archive(file_path: str) -> dict[str, Any]:
                 mode = "CBZ_TOC"
                 sample_entries = imgs[:5]
         except Exception:
-            pages = max(1, int(round(size_mb / 1.65)))
+            pages = max(1, round(size_mb / 1.65))
     else:
-        pages = max(1, int(round(size_mb / 1.65)))
+        pages = max(1, round(size_mb / 1.65))
 
     classification = "SINGLE_ISSUE"
     if pages < 5 or size_mb < 3.0:
@@ -991,7 +1001,7 @@ def enforcer_batch_audit_files(
     enriched = []
     for parent_label, fn, fp in sliced:
         size_mb = round(os.path.getsize(fp) / (1024 * 1024), 2)
-        pages = max(1, int(round(size_mb / 1.65)))
+        pages = max(1, round(size_mb / 1.65))
         mode = "SIZE_EST"
         if fn.lower().endswith(".cbz"):
             try:
