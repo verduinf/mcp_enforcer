@@ -27,16 +27,26 @@ import uvicorn
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 
-MCP_ROOT = r"D:\Dev\mcp_enforcer"
-ACT_ROOT = r"D:\Dev\act-tracker"
-RAG_ROOT = r"D:\Dev\marvel_rag"
-LOG_DIR = r"D:\Share\mcp_enforcer_logs"
+MCP_ROOT = r"D:\Dev\mcp_enforcer" if os.path.exists(r"D:\Dev\mcp_enforcer") else r"C:\Dev\mcp_enforcer"
+ACT_ROOT = r"D:\Dev\act-tracker" if os.path.exists(r"D:\Dev\act-tracker") else r"C:\Dev\act-tracker"
+RAG_ROOT = r"D:\Dev\marvel_rag" if os.path.exists(r"D:\Dev\marvel_rag") else r"C:\Dev\marvel_rag"
+LOG_DIR = r"D:\Share\mcp_enforcer_logs" if os.path.exists(r"D:\Share") else os.path.join(MCP_ROOT, "logs")
 MAX_LOG_BYTES = 5 * 1024  # 5 KB per file
 MAX_LOG_FILES = 100       # Max 100 rolling timestamped files kept
 
 for p in (MCP_ROOT, ACT_ROOT, RAG_ROOT):
     if p not in sys.path and os.path.exists(p):
         sys.path.insert(0, p)
+
+# Dynamically unify 'src' namespace package so both act-tracker and marvel_rag resolve cleanly
+try:
+    import src  # type: ignore
+    for _root in (ACT_ROOT, RAG_ROOT):
+        _src_dir = os.path.join(_root, "src")
+        if os.path.exists(_src_dir) and hasattr(src, "__path__") and _src_dir not in src.__path__:
+            src.__path__.append(_src_dir)
+except ImportError:
+    pass
 
 # Keep temporary agent session files off C:\
 os.makedirs(r"D:\Temp", exist_ok=True)
@@ -802,12 +812,26 @@ def marvel_resolve_tpb(
 @mcp.tool()
 def marvel_hybrid_search(query: str, top_k: int = 5) -> dict[str, Any]:
     """Run hybrid FTS5 lexical + BGE-small dense vector search against Enforcer's `marvel_kb.db`."""
-    from src.marvel_rag import MarvelRAG
+    from src.marvel_rag import MarvelRAG  # type: ignore
 
     if _KB_CACHE["rag_instance"] is None:
         _KB_CACHE["rag_instance"] = MarvelRAG(db_path=KB_DB_PATH, vectors_path=VECTORS_PATH)
     rag: MarvelRAG = _KB_CACHE["rag_instance"]
-    results = rag.hybrid_search(query, top_k=top_k)
+    chunks = rag.retrieve(query=query, top_k=top_k)
+    results = [
+        {
+            "chunk_id": c.chunk_id,
+            "page_id": c.page_id,
+            "title": c.title,
+            "universe": c.universe,
+            "template_type": c.template_type,
+            "section": c.section,
+            "display_text": c.display_text,
+            "score": c.score,
+            "retrieval_source": c.retrieval_source,
+        }
+        for c in chunks
+    ]
     return {"query": query, "results": results}
 
 
@@ -941,8 +965,8 @@ def enforcer_batch_audit_files(
     Clio on Aether (running on your Google AI Pro subscription) can audit & propose renames directly!
     """
     _ensure_kb_cache()
-    from src.core.parser import parse_incoming_file
-    from src.core.rename_cleaner import scrub_release_groups
+    from src.core.parser import parse_incoming_file  # type: ignore
+    from src.core.rename_cleaner import scrub_release_groups  # type: ignore
 
     target_dir = os.path.join(STAGING_ROOT, subfolder)
     if not os.path.exists(target_dir):
