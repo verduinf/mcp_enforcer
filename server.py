@@ -7,6 +7,7 @@ git hot-sync (`enforcer_git_sync`), and optional local Clio subagent invocation
 over TLS (`https://192.168.178.36:8765/mcp`) with Uvicorn `--reload` auto-discovery.
 """
 
+import ctypes
 import datetime
 import glob
 import hashlib
@@ -1054,6 +1055,18 @@ _mcp_starlette = mcp.streamable_http_app(
 )
 
 
+_ES_SYSTEM_REQUIRED = 0x00000001
+
+
+def _nudge_keep_awake() -> None:
+    """Reset Windows idle sleep timer on incoming MCP requests without altering power plans."""
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.kernel32.SetThreadExecutionState(_ES_SYSTEM_REQUIRED)
+        except Exception:
+            pass
+
+
 class _AcceptHeaderNormalizer:
     """
     1. Ensures MCP clients sending only `Accept: application/json` never get 406 Not Acceptable.
@@ -1070,6 +1083,7 @@ class _AcceptHeaderNormalizer:
 
         global _LAST_ACTIVITY_TIME
         _LAST_ACTIVITY_TIME = time.time()
+        _nudge_keep_awake()
 
         headers = list(scope.get("headers", []))
         new_headers = [(k, v) for k, v in headers if k.lower() != b"accept"]
