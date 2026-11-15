@@ -679,9 +679,50 @@ def enforcer_watchdog_config(
     }
 
 
+_ES_CONTINUOUS = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001
+_KEEP_AWAKE_SECONDS = 7200  # 2 hours from last MCP request
+
+
+def _has_active_robocopy() -> bool:
+    """Return True if any robocopy.exe process is currently running on Windows."""
+    if sys.platform != "win32":
+        return False
+    try:
+        out = subprocess.check_output(
+            ["tasklist", "/FI", "IMAGENAME eq robocopy.exe", "/NH"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        return "robocopy.exe" in out.lower()
+    except Exception:
+        return False
+
+
+def _set_keep_awake(active: bool) -> None:
+    """Hold or release a continuous SYSTEM power request on the calling thread."""
+    if sys.platform == "win32":
+        try:
+            flags = (_ES_CONTINUOUS | _ES_SYSTEM_REQUIRED) if active else _ES_CONTINUOUS
+            ctypes.windll.kernel32.SetThreadExecutionState(flags)
+        except Exception:
+            pass
+
+
 def _watchdog_loop() -> None:
+    _holding_awake = False
     while True:
         try:
+            idle = time.time() - _LAST_ACTIVITY_TIME
+            should_hold = idle < _KEEP_AWAKE_SECONDS or _has_active_robocopy()
+            if should_hold:
+                _set_keep_awake(True)
+                _holding_awake = True
+            elif _holding_awake:
+                _set_keep_awake(False)
+                _holding_awake = False
+
             time.sleep(30)
             if not _WATCHDOG_CONFIG.get("enabled"):
                 continue
@@ -1053,9 +1094,6 @@ _mcp_starlette = mcp.streamable_http_app(
     transport_security=_SECURITY,
     host=_HOST,
 )
-
-
-_ES_SYSTEM_REQUIRED = 0x00000001
 
 
 def _nudge_keep_awake() -> None:
