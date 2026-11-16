@@ -682,6 +682,8 @@ def enforcer_watchdog_config(
 _ES_CONTINUOUS = 0x80000000
 _ES_SYSTEM_REQUIRED = 0x00000001
 _KEEP_AWAKE_SECONDS = 7200  # 2 hours from last MCP request
+_PERF_PLAN_GUID = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"      # Hoge prestaties (High Performance)
+_BALANCED_PLAN_GUID = "381b4222-f694-41f0-9685-ff5bb260df2e"  # Gebalanceerd (Balanced)
 
 
 def _has_active_robocopy() -> bool:
@@ -700,28 +702,29 @@ def _has_active_robocopy() -> bool:
         return False
 
 
-def _set_keep_awake(active: bool) -> None:
-    """Hold or release a continuous SYSTEM power request on the calling thread."""
-    if sys.platform == "win32":
-        try:
-            flags = (_ES_CONTINUOUS | _ES_SYSTEM_REQUIRED) if active else _ES_CONTINUOUS
-            ctypes.windll.kernel32.SetThreadExecutionState(flags)
-        except Exception:
-            pass
+def _ensure_powerplan(target_guid: str, reason: str = "") -> None:
+    """Switch Windows active power scheme to ``target_guid`` if not already active."""
+    if sys.platform != "win32" or not target_guid:
+        return
+    try:
+        plans = _get_powerplans()
+        active = next((p for p in plans if p["is_active"]), None)
+        if active and active["guid"].lower() != target_guid.lower():
+            logger.info("[Watchdog] Switching powerplan to %s (%s)", target_guid, reason)
+            subprocess.run(["powercfg", "/setactive", target_guid], capture_output=True, text=True)
+    except Exception:
+        pass
 
 
 def _watchdog_loop() -> None:
-    _holding_awake = False
     while True:
         try:
             idle = time.time() - _LAST_ACTIVITY_TIME
-            should_hold = idle < _KEEP_AWAKE_SECONDS or _has_active_robocopy()
-            if should_hold:
-                _set_keep_awake(True)
-                _holding_awake = True
-            elif _holding_awake:
-                _set_keep_awake(False)
-                _holding_awake = False
+            if idle < _KEEP_AWAKE_SECONDS or _has_active_robocopy():
+                _ensure_powerplan(_PERF_PLAN_GUID, "active MCP/robocopy keep-awake")
+            else:
+                idle_guid = _WATCHDOG_CONFIG.get("sleep_plan_guid") or _BALANCED_PLAN_GUID
+                _ensure_powerplan(idle_guid, f"idle {idle:.0f}s >= {_KEEP_AWAKE_SECONDS}s")
 
             time.sleep(30)
             if not _WATCHDOG_CONFIG.get("enabled"):
@@ -732,15 +735,8 @@ def _watchdog_loop() -> None:
                 continue
 
             idle = time.time() - _LAST_ACTIVITY_TIME
-            if idle >= timeout:
-                plans = _get_powerplans()
-                active = next((p for p in plans if p["is_active"]), None)
-                if active and active["guid"].lower() != target_guid.lower():
-                    logger.warning(
-                        "[Watchdog] Inactivity timeout reached (idle %.0fs >= %ds). Switching powerplan to '%s' (%s)",
-                        idle, timeout, _WATCHDOG_CONFIG.get("sleep_plan_name"), target_guid
-                    )
-                    subprocess.run(["powercfg", "/setactive", target_guid], capture_output=True, text=True)
+            if idle >= timeout and not _has_active_robocopy():
+                _ensure_powerplan(target_guid, f"watchdog timeout {idle:.0f}s >= {timeout}s")
         except Exception:
             pass
 
