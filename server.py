@@ -343,7 +343,12 @@ _WATCHDOG_CONFIG: dict[str, Any] = {
 def _get_powerplans() -> list[dict[str, Any]]:
     """Parse output of `powercfg /list`."""
     try:
-        out = subprocess.check_output(["powercfg", "/list"], text=True, stderr=subprocess.DEVNULL)
+        out = subprocess.check_output(
+            ["powercfg", "/list"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
     except Exception:
         return []
     plans = []
@@ -546,6 +551,7 @@ def enforcer_terminal(command: str, timeout_seconds: int = 60) -> dict[str, Any]
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         return {
             "command": command,
@@ -684,6 +690,7 @@ _ES_SYSTEM_REQUIRED = 0x00000001
 _KEEP_AWAKE_SECONDS = 7200  # 2 hours from last MCP request
 _PERF_PLAN_GUID = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"      # Hoge prestaties (High Performance)
 _BALANCED_PLAN_GUID = "381b4222-f694-41f0-9685-ff5bb260df2e"  # Gebalanceerd (Balanced)
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def _has_active_robocopy() -> bool:
@@ -696,6 +703,7 @@ def _has_active_robocopy() -> bool:
             text=True,
             stderr=subprocess.DEVNULL,
             timeout=5,
+            creationflags=_NO_WINDOW,
         )
         return "robocopy.exe" in out.lower()
     except Exception:
@@ -711,7 +719,12 @@ def _ensure_powerplan(target_guid: str, reason: str = "") -> None:
         active = next((p for p in plans if p["is_active"]), None)
         if active and active["guid"].lower() != target_guid.lower():
             logger.info("[Watchdog] Switching powerplan to %s (%s)", target_guid, reason)
-            subprocess.run(["powercfg", "/setactive", target_guid], capture_output=True, text=True)
+            subprocess.run(
+                ["powercfg", "/setactive", target_guid],
+                capture_output=True,
+                text=True,
+                creationflags=_NO_WINDOW,
+            )
     except Exception:
         pass
 

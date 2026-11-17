@@ -67,6 +67,7 @@ def cleanup_port_8765() -> None:
         ["powershell", "-NoProfile", "-Command", ps],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
     )
 
 
@@ -99,6 +100,7 @@ def main() -> int:
                     stdout=ulog,
                     stderr=subprocess.STDOUT,
                     stdin=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
                 )
                 rc = proc.wait()
 

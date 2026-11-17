@@ -91,6 +91,7 @@ def kill_port_8765() -> None:
         ["powershell", "-NoProfile", "-Command", ps],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
     )
 
 
@@ -100,17 +101,17 @@ def start_supervisor() -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        creationflags=subprocess.CREATE_NO_WINDOW,
     )
     if res.returncode == 0:
         log("Started EnforcerMcpServer scheduled task.")
         return
 
-    DETACHED_PROCESS = 0x00000008
     CREATE_NEW_PROCESS_GROUP = 0x00000200
     subprocess.Popen(
         [PYTHONW_EXE, str(SUPERVISOR_PY)],
         cwd=str(BASE_DIR),
-        creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+        creationflags=subprocess.CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
