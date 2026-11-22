@@ -1114,6 +1114,61 @@ def _nudge_keep_awake() -> None:
             pass
 
 
+@mcp.tool()
+def enforcer_screenshot(save_path: str = r"D:\Temp\enforcer_screen.png") -> dict[str, Any]:
+    """
+    Capture a live PNG screenshot of Enforcer's interactive desktop (Session 1) with an overlaid timestamp.
+    Also accessible in any browser via `GET /screen` (30s auto-refresh) and `GET /screenshot.png`.
+    """
+    return _capture_desktop_screenshot(save_path=save_path)
+
+
+def _capture_desktop_screenshot(save_path: str = r"D:\Temp\enforcer_screen.png") -> dict[str, Any]:
+    """Capture Enforcer's primary/virtual screen to `save_path` with a timestamp banner using .NET System.Drawing."""
+    os.makedirs(os.path.dirname(save_path) or r"D:\Temp", exist_ok=True)
+    ts_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ps_script = rf"""
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+$bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$g.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+$font = New-Object System.Drawing.Font('Consolas', 16, [System.Drawing.FontStyle]::Bold)
+$text = 'Enforcer | {ts_str}'
+$sz = $g.MeasureString($text, $font)
+$pad = 10
+$rx = [int]($bounds.Width - $sz.Width - $pad * 2 - 16)
+$ry = 16
+$bgBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(200, 15, 23, 42))
+$fgBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 248, 250, 252))
+$g.FillRectangle($bgBrush, $rx, $ry, [int]($sz.Width + $pad * 2), [int]($sz.Height + $pad))
+$g.DrawString($text, $font, $fgBrush, ($rx + $pad), ($ry + [int]($pad / 2)))
+$bmp.Save('{save_path.replace("'", "''")}', [System.Drawing.Imaging.ImageFormat]::Png)
+$g.Dispose()
+$bmp.Dispose()
+"""
+    proc = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        creationflags=_NO_WINDOW,
+    )
+    if proc.returncode != 0 or not os.path.exists(save_path):
+        return {
+            "success": False,
+            "error": proc.stderr.strip() or "Screenshot capture failed",
+            "timestamp": ts_str,
+        }
+    return {
+        "success": True,
+        "path": save_path,
+        "bytes": os.path.getsize(save_path),
+        "timestamp": ts_str,
+    }
+
+
 class _AcceptHeaderNormalizer:
     """
     1. Ensures MCP clients sending only `Accept: application/json` never get 406 Not Acceptable.
@@ -1128,6 +1183,104 @@ class _AcceptHeaderNormalizer:
             await self.inner_app(scope, receive, send)
             return
 
+        path = scope.get("path", "/mcp")
+        method = scope.get("method", "POST")
+
+        if method == "GET" and path == "/screenshot.png":
+            res = _capture_desktop_screenshot()
+            if res.get("success") and os.path.exists(res["path"]):
+                with open(res["path"], "rb") as f:
+                    data = f.read()
+                await send({
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [
+                        (b"content-type", b"image/png"),
+                        (b"cache-control", b"no-store, no-cache, must-revalidate"),
+                        (b"x-captured-at", res["timestamp"].encode("ascii")),
+                        (b"content-length", str(len(data)).encode("ascii")),
+                    ],
+                })
+                await send({"type": "http.response.body", "body": data})
+            else:
+                err = json.dumps(res).encode("utf-8")
+                await send({
+                    "type": "http.response.start",
+                    "status": 500,
+                    "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(err)).encode("ascii"))],
+                })
+                await send({"type": "http.response.body", "body": err})
+            return
+
+        if method == "GET" and path in ("/screen", "/screen/"):
+            html = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Enforcer Screen Watcher</title>
+<style>
+  body { margin: 0; background: #0f172a; color: #e2e8f0; font-family: system-ui, -apple-system, sans-serif; display: flex; flex-direction: column; height: 100vh; }
+  header { display: flex; align-items: center; justify-content: space-between; padding: 10px 18px; background: #1e293b; border-bottom: 1px solid #334155; font-size: 14px; }
+  .meta { display: flex; gap: 16px; align-items: center; }
+  .badge { background: #0f172a; padding: 4px 10px; border-radius: 6px; border: 1px solid #334155; font-family: monospace; }
+  button { background: #2563eb; color: #fff; border: 0; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-weight: 600; }
+  button.secondary { background: #334155; }
+  main { flex: 1; display: flex; align-items: center; justify-content: center; overflow: auto; padding: 10px; }
+  img { max-width: 100%; max-height: 100%; object-fit: contain; border: 1px solid #334155; border-radius: 6px; box-shadow: 0 10px 30px rgba(0,0,0,0.45); }
+</style>
+</head>
+<body>
+<header>
+  <div><strong>Enforcer Screen Watcher</strong> (192.168.178.36)</div>
+  <div class="meta">
+    <span class="badge" id="ts">Loading...</span>
+    <span class="badge" id="cd">Next: 30s</span>
+    <button onclick="refreshNow()">Refresh Now</button>
+    <button class="secondary" id="toggleBtn" onclick="togglePause()">Pause</button>
+  </div>
+</header>
+<main><img id="scr" alt="Enforcer desktop" /></main>
+<script>
+  const INTERVAL = 30;
+  let sec = INTERVAL, paused = false;
+  const img = document.getElementById('scr');
+  const ts = document.getElementById('ts');
+  const cd = document.getElementById('cd');
+  const btn = document.getElementById('toggleBtn');
+  function refreshNow() {
+    const now = new Date();
+    img.src = '/screenshot.png?t=' + now.getTime();
+    ts.textContent = 'Updated: ' + now.toLocaleString();
+    sec = INTERVAL;
+    cd.textContent = paused ? 'Paused' : ('Next: ' + sec + 's');
+  }
+  function togglePause() {
+    paused = !paused;
+    btn.textContent = paused ? 'Resume' : 'Pause';
+    cd.textContent = paused ? 'Paused' : ('Next: ' + sec + 's');
+  }
+  setInterval(() => {
+    if (paused) return;
+    sec -= 1;
+    if (sec <= 0) refreshNow();
+    else cd.textContent = 'Next: ' + sec + 's';
+  }, 1000);
+  refreshNow();
+</script>
+</body>
+</html>""".encode("utf-8")
+            await send({
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (b"content-type", b"text/html; charset=utf-8"),
+                    (b"cache-control", b"no-store"),
+                    (b"content-length", str(len(html)).encode("ascii")),
+                ],
+            })
+            await send({"type": "http.response.body", "body": html})
+            return
+
         global _LAST_ACTIVITY_TIME
         _LAST_ACTIVITY_TIME = time.time()
         _nudge_keep_awake()
@@ -1138,8 +1291,6 @@ class _AcceptHeaderNormalizer:
         scope = dict(scope, headers=new_headers)
 
         client = scope.get("client") or ("unknown", 0)
-        method = scope.get("method", "POST")
-        path = scope.get("path", "/mcp")
         body_chunks: list[bytes] = []
         status_code_holder: list[int] = [0]
 
